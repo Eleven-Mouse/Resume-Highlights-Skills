@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -70,6 +71,9 @@ AREA_LABELS = {
     "data_assets": "数据资产线索",
     "tests": "测试线索",
     "ai_assets": "AI 相关线索",
+    "docs_assets": "规则文档线索",
+    "automation_assets": "自动化脚本线索",
+    "agent_assets": "Agent 配置线索",
 }
 
 LANGUAGE_BY_SUFFIX = {
@@ -133,23 +137,23 @@ TEXT_CONFIG_SUFFIXES = {
 }
 
 AUXILIARY_DIRS = {"docs", "doc", "references", "scripts", "agents"}
+DOC_LIKE_SUFFIXES = {".md", ".yaml", ".yml", ".toml", ".json"}
 
 
 def should_skip_dir(path: Path) -> bool:
     return path.name in IGNORED_DIRS
 
 
-def collect_files(repo_root: Path) -> list[Path]:
+def walk_repo(repo_root: Path) -> tuple[list[Path], int]:
     files: list[Path] = []
-    for path in repo_root.rglob("*"):
-        if path.is_dir() and should_skip_dir(path):
-            continue
-        if not path.is_file():
-            continue
-        if any(part in IGNORED_DIRS for part in path.parts):
-            continue
-        files.append(path)
-    return files
+    dir_count = 0
+    for current_root, dirs, filenames in os.walk(repo_root, topdown=True):
+        dirs[:] = [name for name in dirs if name not in IGNORED_DIRS]
+        dir_count += len(dirs)
+        current_path = Path(current_root)
+        for filename in filenames:
+            files.append(current_path / filename)
+    return files, dir_count
 
 
 def top_level_overview(repo_root: Path) -> dict[str, list[str]]:
@@ -172,6 +176,15 @@ def detect_key_files(repo_root: Path) -> list[str]:
         if candidate.exists():
             found.append(name)
     return found
+
+
+def read_text_safely(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
 
 
 def summarize_languages(files: list[Path], repo_root: Path) -> list[dict[str, object]]:
@@ -202,9 +215,44 @@ def summarize_extensions(files: list[Path]) -> list[dict[str, object]]:
     return [{"extension": ext, "files": count} for ext, count in counts.most_common(12)]
 
 
+def looks_like_tooling_repo(files: list[Path], repo_root: Path) -> bool:
+    source_files = 0
+    doc_like_files = 0
+    auxiliary_files = 0
+    for path in files:
+        rel_parts = {part.lower() for part in path.relative_to(repo_root).parts}
+        suffix = path.suffix.lower()
+        if suffix in SOURCE_SUFFIXES:
+            source_files += 1
+        if suffix in DOC_LIKE_SUFFIXES:
+            doc_like_files += 1
+        if rel_parts & AUXILIARY_DIRS:
+            auxiliary_files += 1
+    return auxiliary_files >= 2 and doc_like_files >= source_files
+
+
+def detect_tooling_areas(files: list[Path], repo_root: Path) -> dict[str, list[str]]:
+    matches: dict[str, list[str]] = {}
+    area_prefixes = {
+        "docs_assets": "references/",
+        "automation_assets": "scripts/",
+        "agent_assets": "agents/",
+    }
+    for area, prefix in area_prefixes.items():
+        paths = [path.relative_to(repo_root).as_posix() for path in files if path.relative_to(repo_root).as_posix().startswith(prefix)]
+        if paths:
+            matches[area] = paths[:10]
+    return matches
+
+
 def detect_areas(files: list[Path], repo_root: Path) -> dict[str, list[str]]:
     matches: dict[str, list[str]] = {}
     for area, keywords in AREA_KEYWORDS.items():
+        if area == "entrypoints":
+            entrypoints = likely_entrypoints(files, repo_root)
+            if entrypoints:
+                matches[area] = entrypoints
+            continue
         paths: list[str] = []
         for path in files:
             rel = path.relative_to(repo_root).as_posix().lower()
@@ -214,6 +262,8 @@ def detect_areas(files: list[Path], repo_root: Path) -> dict[str, list[str]]:
                 if suffix not in SOURCE_SUFFIXES:
                     continue
                 if rel_parts & AUXILIARY_DIRS:
+                    continue
+                if area in {"controllers", "services", "data_access"} and rel_parts & {"test", "tests"}:
                     continue
             if area == "infra" and suffix not in SOURCE_SUFFIXES | TEXT_CONFIG_SUFFIXES and path.name not in KEY_FILES:
                 continue
@@ -225,29 +275,41 @@ def detect_areas(files: list[Path], repo_root: Path) -> dict[str, list[str]]:
                 break
         if paths:
             matches[area] = paths
+    tooling_matches = detect_tooling_areas(files, repo_root)
+    if tooling_matches and (not matches or looks_like_tooling_repo(files, repo_root)):
+        matches.update({area: paths for area, paths in tooling_matches.items() if area not in matches})
     return matches
 
 
+def is_likely_entrypoint(path: Path, repo_root: Path) -> bool:
+    rel = path.relative_to(repo_root).as_posix()
+    name = path.name
+    suffix = path.suffix.lower()
+    text = read_text_safely(path)
+
+    if suffix == ".java":
+        return name.endswith("Application.java") or "public static void main" in text
+    if suffix == ".py":
+        return name in {"main.py", "app.py", "server.py", "manage.py"} or '__name__ == "__main__"' in text
+    if suffix == ".go":
+        return name == "main.go" or ("/cmd/" in rel and "package main" in text)
+    if suffix in {".js", ".ts"}:
+        return name in {"main.js", "main.ts", "index.js", "index.ts"} and any(
+            marker in text for marker in ("listen(", "createApp(", "bootstrap(", "new Server(")
+        )
+    return False
+
+
 def likely_entrypoints(files: list[Path], repo_root: Path) -> list[str]:
-    preferred_names = {
-        "main.py",
-        "app.py",
-        "server.py",
-        "manage.py",
-        "Application.java",
-        "Main.java",
-        "main.go",
-        "index.ts",
-        "index.js",
-        "main.ts",
-        "main.js",
-    }
     results: list[str] = []
     for path in files:
-        name = path.name
+        if path.suffix.lower() not in SOURCE_SUFFIXES:
+            continue
+        rel_parts = {part.lower() for part in path.relative_to(repo_root).parts}
+        if rel_parts & AUXILIARY_DIRS:
+            continue
         rel = path.relative_to(repo_root).as_posix()
-        rel_lower = rel.lower()
-        if name in preferred_names or "src/main" in rel_lower or "/cmd/" in rel_lower:
+        if is_likely_entrypoint(path, repo_root):
             results.append(rel)
         if len(results) >= 10:
             break
@@ -255,11 +317,7 @@ def likely_entrypoints(files: list[Path], repo_root: Path) -> list[str]:
 
 
 def build_snapshot(repo_root: Path) -> dict[str, object]:
-    files = collect_files(repo_root)
-    dir_count = 0
-    for path in repo_root.rglob("*"):
-        if path.is_dir() and not any(part in IGNORED_DIRS for part in path.parts):
-            dir_count += 1
+    files, dir_count = walk_repo(repo_root)
 
     return {
         "repo_root": str(repo_root),

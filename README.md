@@ -74,6 +74,26 @@ agents/
 4. 改扫描逻辑，改 `scripts/repo_snapshot.py`。
 5. 不要把 `SKILL.md` 再写回“大一统长提示词”。
 
+## 自测命令
+
+改完后，至少跑下面两条：
+
+```powershell
+python scripts\repo_snapshot.py .
+```
+
+用途：确认结构摘要能正常输出，且当前这类文档型 / 工具型仓库仍能识别出 `references`、`scripts`、`agents` 线索。
+
+```powershell
+python -m unittest tests.test_repo_snapshot
+```
+
+用途：回归验证 `repo_snapshot.py` 的 3 个关键行为：
+
+- 不把普通 `service` 误判成入口
+- 真正忽略 `node_modules`、`target` 等目录
+- 文档型 / 工具型仓库仍能给出有效区域线索
+
 ## 当前支持的常见输出
 
 - 快速点评版
@@ -85,14 +105,7 @@ agents/
 - 系统优化专项
 - 风险审查与自检
 
-常见岗位版本：
-
-- Java 后端工程师版本
-- AI 应用开发工程师版本
-- 前端开发工程师版本
-- 全栈工程师版本
-- 主项目版本
-- 次项目版本
+常见岗位版本和长报告模板不要在这里重复维护，统一以 [references/output-formats.md](references/output-formats.md) 和 [references/detailed-report-template.md](references/detailed-report-template.md) 为准。
 
 ## 维护时别踩坑
 
