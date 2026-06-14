@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+"""生成轻量级、只基于仓库事实的结构摘要。"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from collections import Counter, defaultdict
+from pathlib import Path
+
+
+IGNORED_DIRS = {
+    ".git",
+    ".idea",
+    ".vscode",
+    ".gradle",
+    ".mvn",
+    "node_modules",
+    "target",
+    "build",
+    "dist",
+    "out",
+    "__pycache__",
+    ".pytest_cache",
+    ".venv",
+    "venv",
+}
+
+KEY_FILES = [
+    "README.md",
+    "README",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "settings.gradle",
+    "settings.gradle.kts",
+    "package.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "package-lock.json",
+    "pyproject.toml",
+    "requirements.txt",
+    "go.mod",
+    "Cargo.toml",
+    "Dockerfile",
+    "docker-compose.yml",
+    "docker-compose.yaml",
+    ".github/workflows",
+    "Jenkinsfile",
+    "Makefile",
+]
+
+AREA_KEYWORDS = {
+    "entrypoints": ("main", "app", "bootstrap", "server", "router", "route"),
+    "controllers": ("controller", "handler", "api", "endpoint"),
+    "services": ("service", "usecase", "use_case", "workflow", "agent"),
+    "data_access": ("repository", "repo", "dao", "mapper", "entity", "model", "schema"),
+    "infra": ("config", "docker", "k8s", "helm", "deploy", "infra"),
+    "data_assets": ("sql", "migration", "ddl", "seed", "fixture"),
+    "tests": ("test", "spec", "benchmark", "eval"),
+    "ai_assets": ("prompt", "rag", "retriev", "embedding", "vector", "tool"),
+}
+
+AREA_LABELS = {
+    "entrypoints": "入口线索",
+    "controllers": "接口入口",
+    "services": "服务层线索",
+    "data_access": "数据访问层线索",
+    "infra": "基础设施线索",
+    "data_assets": "数据资产线索",
+    "tests": "测试线索",
+    "ai_assets": "AI 相关线索",
+}
+
+LANGUAGE_BY_SUFFIX = {
+    ".py": "Python",
+    ".java": "Java",
+    ".kt": "Kotlin",
+    ".js": "JavaScript",
+    ".jsx": "JavaScript",
+    ".ts": "TypeScript",
+    ".tsx": "TypeScript",
+    ".go": "Go",
+    ".rs": "Rust",
+    ".cpp": "C++",
+    ".cc": "C++",
+    ".cxx": "C++",
+    ".c": "C",
+    ".cs": "C#",
+    ".php": "PHP",
+    ".rb": "Ruby",
+    ".scala": "Scala",
+    ".sql": "SQL",
+    ".sh": "Shell",
+    ".ps1": "PowerShell",
+    ".yaml": "YAML",
+    ".yml": "YAML",
+    ".toml": "TOML",
+    ".xml": "XML",
+    ".json": "JSON",
+    ".md": "Markdown",
+}
+
+SOURCE_SUFFIXES = {
+    ".py",
+    ".java",
+    ".kt",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".go",
+    ".rs",
+    ".cpp",
+    ".cc",
+    ".cxx",
+    ".c",
+    ".cs",
+    ".php",
+    ".rb",
+    ".scala",
+    ".sql",
+    ".sh",
+    ".ps1",
+}
+
+TEXT_CONFIG_SUFFIXES = {
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".json",
+    ".xml",
+}
+
+AUXILIARY_DIRS = {"docs", "doc", "references", "scripts", "agents"}
+
+
+def should_skip_dir(path: Path) -> bool:
+    return path.name in IGNORED_DIRS
+
+
+def collect_files(repo_root: Path) -> list[Path]:
+    files: list[Path] = []
+    for path in repo_root.rglob("*"):
+        if path.is_dir() and should_skip_dir(path):
+            continue
+        if not path.is_file():
+            continue
+        if any(part in IGNORED_DIRS for part in path.parts):
+            continue
+        files.append(path)
+    return files
+
+
+def top_level_overview(repo_root: Path) -> dict[str, list[str]]:
+    dirs: list[str] = []
+    files: list[str] = []
+    for child in sorted(repo_root.iterdir(), key=lambda item: (item.is_file(), item.name.lower())):
+        if child.name in IGNORED_DIRS:
+            continue
+        if child.is_dir():
+            dirs.append(child.name)
+        else:
+            files.append(child.name)
+    return {"dirs": dirs, "files": files}
+
+
+def detect_key_files(repo_root: Path) -> list[str]:
+    found: list[str] = []
+    for name in KEY_FILES:
+        candidate = repo_root / name
+        if candidate.exists():
+            found.append(name)
+    return found
+
+
+def summarize_languages(files: list[Path], repo_root: Path) -> list[dict[str, object]]:
+    by_lang: Counter[str] = Counter()
+    by_files: defaultdict[str, list[str]] = defaultdict(list)
+    for path in files:
+        lang = LANGUAGE_BY_SUFFIX.get(path.suffix.lower())
+        if not lang:
+            continue
+        by_lang[lang] += 1
+        if len(by_files[lang]) < 5:
+            by_files[lang].append(path.relative_to(repo_root).as_posix())
+
+    items = []
+    for lang, count in by_lang.most_common():
+        items.append(
+            {
+                "language": lang,
+                "files": count,
+                "examples": by_files[lang],
+            }
+        )
+    return items
+
+
+def summarize_extensions(files: list[Path]) -> list[dict[str, object]]:
+    counts = Counter(path.suffix.lower() or "[无后缀]" for path in files)
+    return [{"extension": ext, "files": count} for ext, count in counts.most_common(12)]
+
+
+def detect_areas(files: list[Path], repo_root: Path) -> dict[str, list[str]]:
+    matches: dict[str, list[str]] = {}
+    for area, keywords in AREA_KEYWORDS.items():
+        paths: list[str] = []
+        for path in files:
+            rel = path.relative_to(repo_root).as_posix().lower()
+            suffix = path.suffix.lower()
+            rel_parts = {part.lower() for part in path.relative_to(repo_root).parts}
+            if area in {"entrypoints", "controllers", "services", "data_access", "tests", "ai_assets"}:
+                if suffix not in SOURCE_SUFFIXES:
+                    continue
+                if rel_parts & AUXILIARY_DIRS:
+                    continue
+            if area == "infra" and suffix not in SOURCE_SUFFIXES | TEXT_CONFIG_SUFFIXES and path.name not in KEY_FILES:
+                continue
+            if area == "data_assets" and suffix not in SOURCE_SUFFIXES | TEXT_CONFIG_SUFFIXES:
+                continue
+            if any(keyword in rel for keyword in keywords):
+                paths.append(path.relative_to(repo_root).as_posix())
+            if len(paths) >= 10:
+                break
+        if paths:
+            matches[area] = paths
+    return matches
+
+
+def likely_entrypoints(files: list[Path], repo_root: Path) -> list[str]:
+    preferred_names = {
+        "main.py",
+        "app.py",
+        "server.py",
+        "manage.py",
+        "Application.java",
+        "Main.java",
+        "main.go",
+        "index.ts",
+        "index.js",
+        "main.ts",
+        "main.js",
+    }
+    results: list[str] = []
+    for path in files:
+        name = path.name
+        rel = path.relative_to(repo_root).as_posix()
+        rel_lower = rel.lower()
+        if name in preferred_names or "src/main" in rel_lower or "/cmd/" in rel_lower:
+            results.append(rel)
+        if len(results) >= 10:
+            break
+    return results
+
+
+def build_snapshot(repo_root: Path) -> dict[str, object]:
+    files = collect_files(repo_root)
+    dir_count = 0
+    for path in repo_root.rglob("*"):
+        if path.is_dir() and not any(part in IGNORED_DIRS for part in path.parts):
+            dir_count += 1
+
+    return {
+        "repo_root": str(repo_root),
+        "top_level": top_level_overview(repo_root),
+        "counts": {
+            "files": len(files),
+            "dirs": dir_count,
+        },
+        "key_files": detect_key_files(repo_root),
+        "likely_entrypoints": likely_entrypoints(files, repo_root),
+        "languages": summarize_languages(files, repo_root),
+        "extensions": summarize_extensions(files),
+        "area_hints": detect_areas(files, repo_root),
+    }
+
+
+def render_markdown(snapshot: dict[str, object]) -> str:
+    lines: list[str] = []
+    lines.append("# 仓库结构摘要")
+    lines.append("")
+    lines.append("> 这是一份只基于仓库事实的结构摘要，本身不直接推导业务价值。")
+    lines.append("")
+    lines.append("## 规模统计")
+    lines.append("")
+    counts = snapshot["counts"]
+    lines.append(f"- 文件数：{counts['files']}")
+    lines.append(f"- 目录数：{counts['dirs']}")
+    lines.append("")
+    lines.append("## 顶层结构")
+    lines.append("")
+    top_level = snapshot["top_level"]
+    if top_level["dirs"]:
+        lines.append("- 顶层目录：")
+        for item in top_level["dirs"]:
+            lines.append(f"  - `{item}`")
+    if top_level["files"]:
+        lines.append("- 顶层文件：")
+        for item in top_level["files"]:
+            lines.append(f"  - `{item}`")
+    lines.append("")
+    lines.append("## 关键清单文件")
+    lines.append("")
+    if snapshot["key_files"]:
+        for item in snapshot["key_files"]:
+            lines.append(f"- `{item}`")
+    else:
+        lines.append("- 内置清单里没有命中常见关键文件")
+    lines.append("")
+    lines.append("## 疑似入口")
+    lines.append("")
+    if snapshot["likely_entrypoints"]:
+        for item in snapshot["likely_entrypoints"]:
+            lines.append(f"- `{item}`")
+    else:
+        lines.append("- 按文件名启发式未发现明显入口")
+    lines.append("")
+    lines.append("## 语言分布")
+    lines.append("")
+    for item in snapshot["languages"]:
+        examples = ", ".join(f"`{path}`" for path in item["examples"])
+        lines.append(f"- {item['language']}：{item['files']} 个文件")
+        if examples:
+            lines.append(f"  - 示例：{examples}")
+    if not snapshot["languages"]:
+        lines.append("- 没有识别到已知语言后缀")
+    lines.append("")
+    lines.append("## 扩展名分布")
+    lines.append("")
+    for item in snapshot["extensions"]:
+        lines.append(f"- `{item['extension']}`：{item['files']}")
+    lines.append("")
+    lines.append("## 区域线索")
+    lines.append("")
+    area_hints = snapshot["area_hints"]
+    if area_hints:
+        for area, paths in area_hints.items():
+            label = AREA_LABELS.get(area, area)
+            lines.append(f"- {label}：")
+            for path in paths:
+                lines.append(f"  - `{path}`")
+    else:
+        lines.append("- 按路径启发式未发现明显区域线索")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="生成仓库结构摘要。")
+    parser.add_argument("repo_path", help="仓库根目录路径")
+    parser.add_argument(
+        "--format",
+        choices=("markdown", "json"),
+        default="markdown",
+        help="输出格式",
+    )
+    parser.add_argument(
+        "--output",
+        help="可选的输出文件路径；不传则打印到标准输出。",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    repo_root = Path(args.repo_path).resolve()
+    if not repo_root.exists():
+        raise SystemExit(f"未找到仓库目录：{repo_root}")
+    if not repo_root.is_dir():
+        raise SystemExit(f"目标路径不是目录：{repo_root}")
+
+    snapshot = build_snapshot(repo_root)
+    if args.format == "json":
+        content = json.dumps(snapshot, ensure_ascii=False, indent=2)
+    else:
+        content = render_markdown(snapshot)
+
+    if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(content, encoding="utf-8")
+    else:
+        print(content)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

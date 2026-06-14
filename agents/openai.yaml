@@ -1,0 +1,4 @@
+interface:
+  display_name: "项目亮点"
+  short_description: "基于代码事实提炼项目亮点、简历写法与岗位匹配"
+  default_prompt: "Use $project-highlights to analyze this repository and extract evidence-backed 项目亮点、简历表述和岗位匹配结论。"
